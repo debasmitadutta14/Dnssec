@@ -1,171 +1,153 @@
-#include "ns3/core-module.h"
-#include "ns3/network-module.h"
-#include "ns3/internet-module.h"
-#include "ns3/applications-module.h"
-#include "ns3/point-to-point-module.h"
-#include "ns3/mobility-helper.h"
-#include "ns3/mobility-model.h"
-#include "ns3/netanim-module.h"
-#include "ns3/flow-monitor-module.h"
-#include "ns3/flow-monitor-helper.h"
-#include <openssl/sha.h>
-#include <sstream>
-#include <iomanip>
-#include <iostream>
+#include <stdio.h>           // Standard input/output functions
+#include <stdlib.h>          // Memory management and exit functions
+#include <string.h>          // String manipulation functions
+#include <time.h>            // Time-related functions
+#include <openssl/evp.h>     // High-level cryptographic functions
+#include <openssl/pem.h>     // Read/write PEM keys
+#include <openssl/err.h>     // Error handling functions
 
-using namespace ns3;
-using namespace std;
+// Base DNS Resource Record Set (RRSET)
+#define RRSET "example.com IN A 192.0.2.1"
 
-// ---------------------- Simulated Crypto ------------------------
+// TTL for RRSET in seconds (e.g., 1 hour)
+#define TTL_SECONDS 3600
 
-std::string Sha256Hash(std::string message) {
-  unsigned char hash[SHA256_DIGEST_LENGTH];
-  SHA256((unsigned char*)message.c_str(), message.size(), hash);
-
-  std::ostringstream os;
-  for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i)
-    os << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
-  return os.str();
+// Print OpenSSL errors and exit
+void fail() {
+    ERR_print_errors_fp(stderr); // Print detailed OpenSSL errors
+    exit(1);                     // Terminate program
 }
 
-std::string SignWithKey(std::string msg, std::string key) {
-  return Sha256Hash(msg + key);
+// Generate a 2048-bit RSA key
+EVP_PKEY* create_rsa_key() {
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL); // Create key context for RSA
+    if (!ctx || EVP_PKEY_keygen_init(ctx) <= 0) fail();          // Initialize keygen
+    if (EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) <= 0) fail();// Set key size to 2048 bits
+
+    EVP_PKEY *pkey = NULL;
+    if (EVP_PKEY_keygen(ctx, &pkey) <= 0) fail();                // Generate key
+    EVP_PKEY_CTX_free(ctx);                                      // Free context
+    return pkey;                                                 // Return generated key
 }
 
-bool VerifySig(std::string msg, std::string sig, std::string key) {
-  return (SignWithKey(msg, key) == sig);
+// Save private and public keys to files
+void save_keys(EVP_PKEY *key, const char *priv, const char *pub) {
+    FILE *fp = fopen(priv, "w");                                // Open private key file
+    PEM_write_PrivateKey(fp, key, NULL, NULL, 0, NULL, NULL);   // Write private key in PEM
+    fclose(fp);
+
+    fp = fopen(pub, "w");                                       // Open public key file
+    PEM_write_PUBKEY(fp, key);                                  // Write public key in PEM
+    fclose(fp);
 }
 
-// ---------------------- DNSSEC Zone Info ------------------------
+// Load private key from file
+EVP_PKEY* load_private(const char *file) {
+    FILE *fp = fopen(file, "r");                                // Open file for reading
+    EVP_PKEY *key = PEM_read_PrivateKey(fp, NULL, NULL, NULL);  // Load private key
+    fclose(fp);
+    return key;
+}
 
-struct DnsKey {
-  std::string domain;
-  std::string publicKey;
-};
+// Load public key from file
+EVP_PKEY* load_public(const char *file) {
+    FILE *fp = fopen(file, "r");                                // Open file for reading
+    EVP_PKEY *key = PEM_read_PUBKEY(fp, NULL, NULL, NULL);      // Load public key
+    fclose(fp);
+    return key;
+}
 
-DnsKey rootKey   = {"root", "RootPublicKey"};
-DnsKey comKey    = {"com", "ComPublicKey"};
-DnsKey exKey     = {"example.com", "ExamplePublicKey"};
+// Sign a message using a private key
+int sign_msg(EVP_PKEY *key, const unsigned char *msg, size_t len, unsigned char **sig, size_t *sig_len) {
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();                         // Create digest context
+    if (!ctx || EVP_DigestSignInit(ctx, NULL, EVP_sha256(), NULL, key) <= 0) fail();
+    if (EVP_DigestSignUpdate(ctx, msg, len) <= 0) fail();
 
-// ---------------------- DNSSEC Client ----------------------------
+    EVP_DigestSignFinal(ctx, NULL, sig_len);                    // Get signature length
+    *sig = malloc(*sig_len);                                    // Allocate memory for signature
+    if (EVP_DigestSignFinal(ctx, *sig, sig_len) <= 0) fail();   // Generate signature
 
-class DnssecClient : public Application {
-public:
-  void StartApplication() override {
-    std::cout << "\n=== DNSSEC CLIENT VALIDATION CHAIN ===" << std::endl;
+    EVP_MD_CTX_free(ctx);                                       // Clean up
+    return 1;
+}
 
-    // Send dummy UDP packet to visualize in NetAnim
-    Ptr<Socket> udpSocket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
-    Address sinkAddress = InetSocketAddress(Ipv4Address("10.1.1.1"), 9999);
-    udpSocket->Connect(sinkAddress);
-    Ptr<Packet> p = Create<Packet>((uint8_t*)"DNS Query", 9);
-    udpSocket->Send(p);
+// Verify a message's signature using a public key
+int verify_msg(EVP_PKEY *key, const unsigned char *msg, size_t len, unsigned char *sig, size_t sig_len) {
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();                         // Create digest context
+    if (!ctx || EVP_DigestVerifyInit(ctx, NULL, EVP_sha256(), NULL, key) <= 0) fail();
+    if (EVP_DigestVerifyUpdate(ctx, msg, len) <= 0) fail();
 
-    // STEP 1: Validate Root DNSKEY
-    std::string rootDnskeyHash = Sha256Hash(rootKey.publicKey);
-    std::cout << "[ROOT] DNSKEY: " << rootKey.publicKey << "\n[ROOT] DS: " << rootDnskeyHash << std::endl;
+    int ok = EVP_DigestVerifyFinal(ctx, sig, sig_len);          // Verify the signature
+    EVP_MD_CTX_free(ctx);                                       // Clean up
+    return ok;                                                  // Return 1 if valid
+}
 
-    // STEP 2: Validate .com DNSKEY with Root DS
-    std::string comDnskeyHash = Sha256Hash(comKey.publicKey);
-    std::string comDsFromRoot = comDnskeyHash;
-    std::cout << "[.COM] DNSKEY: " << comKey.publicKey << "\n[.COM] DS: " << comDsFromRoot << std::endl;
+int main() {
+    OpenSSL_add_all_algorithms();   // Load OpenSSL algorithms
+    ERR_load_crypto_strings();      // Load error strings
 
-    if (comDsFromRoot != comDnskeyHash) {
-      std::cout << "❌ .COM DNSKEY does not match ROOT DS\n";
-      return;
+    // Step 1: Generate KSK and ZSK
+    EVP_PKEY *ksk = create_rsa_key();  // Key Signing Key
+    EVP_PKEY *zsk = create_rsa_key();  // Zone Signing Key
+    save_keys(ksk, "ksk_priv.pem", "ksk_pub.pem"); // Save KSK keys
+    save_keys(zsk, "zsk_priv.pem", "zsk_pub.pem"); // Save ZSK keys
+
+    // Step 2: Append expiration timestamp to RRSET
+    time_t current_time = time(NULL);                  // Current time
+    time_t expiry_time = current_time + TTL_SECONDS;   // Expiry = now + TTL
+    char full_rrset[512];                              // Buffer for RRSET + timestamp
+    snprintf(full_rrset, sizeof(full_rrset), "%s | Expiry: %ld", RRSET, expiry_time); // Append timestamp
+
+    // Step 3: Sign the timestamped RRSET using ZSK
+    unsigned char *rr_sig = NULL;
+    size_t rr_sig_len = 0;
+    sign_msg(zsk, (unsigned char *)full_rrset, strlen(full_rrset), &rr_sig, &rr_sig_len);
+
+    // Step 4: Sign the ZSK public key with KSK (simulated DNSKEY RRSIG)
+    FILE *fp = fopen("zsk_pub.pem", "rb");
+    fseek(fp, 0, SEEK_END);
+    long zsk_pub_len = ftell(fp);
+    rewind(fp);
+    unsigned char *zsk_data = malloc(zsk_pub_len);
+    fread(zsk_data, 1, zsk_pub_len, fp);
+    fclose(fp);
+
+    unsigned char *zsk_sig = NULL;
+    size_t zsk_sig_len = 0;
+    sign_msg(ksk, zsk_data, zsk_pub_len, &zsk_sig, &zsk_sig_len);
+
+    // Step 5: Verify RRSET and TTL
+    EVP_PKEY *zsk_pub = load_public("zsk_pub.pem");
+    printf("\n✅ Verifying RRSET with ZSK...\n");
+    if (verify_msg(zsk_pub, (unsigned char *)full_rrset, strlen(full_rrset), rr_sig, rr_sig_len) == 1) {
+        printf("✔️  RRSET Signature Valid\n");
+
+        // Extract expiry timestamp
+        long extracted_expiry;
+        sscanf(full_rrset, "%*[^|]| Expiry: %ld", &extracted_expiry); // Parse expiry
+        if (time(NULL) <= extracted_expiry) {
+            printf("🕒 TTL Valid (not expired)\n");
+        } else {
+            printf("❌ TTL Expired\n");
+        }
     } else {
-      std::cout << "✅ .COM DNSKEY validated with ROOT DS\n";
+        printf("❌ RRSET Signature Invalid\n");
     }
 
-    // STEP 3: Validate example.com DNSKEY with .com DS
-    std::string exDnskeyHash = Sha256Hash(exKey.publicKey);
-    std::string exDsFromCom = exDnskeyHash;
-    std::cout << "[example.com] DNSKEY: " << exKey.publicKey << "\n[example.com] DS: " << exDsFromCom << std::endl;
+    // Step 6: Verify ZSK using KSK
+    EVP_PKEY *ksk_pub = load_public("ksk_pub.pem");
+    printf("\n✅ Verifying ZSK with KSK...\n");
+    printf(verify_msg(ksk_pub, zsk_data, zsk_pub_len, zsk_sig, zsk_sig_len) == 1
+           ? "✔️  ZSK Signature Valid\n" : "❌  ZSK Signature Invalid\n");
 
-    if (exDsFromCom != exDnskeyHash) {
-      std::cout << "❌ example.com DNSKEY does not match .COM DS\n";
-      return;
-    } else {
-      std::cout << "✅ example.com DNSKEY validated with .COM DS\n";
-    }
+    // Step 7: Cleanup
+    EVP_PKEY_free(ksk);
+    EVP_PKEY_free(zsk);
+    EVP_PKEY_free(ksk_pub);
+    EVP_PKEY_free(zsk_pub);
+    free(rr_sig);
+    free(zsk_sig);
+    free(zsk_data);
 
-    // STEP 4: Validate signed A record
-    std::string arecord = "example.com A 192.0.2.1";
-    std::string sig = SignWithKey(arecord, exKey.publicKey);
-
-    std::cout << "\n[example.com] RRSIG(A): " << sig << std::endl;
-    if (VerifySig(arecord, sig, exKey.publicKey)) {
-      std::cout << "✅ A record validated with example.com's DNSKEY\n";
-    } else {
-      std::cout << "❌ A record signature invalid\n";
-      return;
-    }
-
-    std::cout << "\n✅ DNSSEC CHAIN VALIDATION COMPLETE" << std::endl;
-    std::cout << "Client verifies the full chain of trust\n";
-  }
-};
-
-// ---------------------- Main NS-3 Simulation ---------------------
-
-int main(int argc, char *argv[]) {
-  NodeContainer nodes;
-  nodes.Create(4); // 0: example.com, 1: com, 2: root, 3: client
-
-  InternetStackHelper stack;
-  stack.Install(nodes);
-
-  PointToPointHelper p2p;
-  p2p.SetDeviceAttribute("DataRate", StringValue("5Mbps"));
-  p2p.SetChannelAttribute("Delay", StringValue("2ms"));
-
-  NetDeviceContainer d1 = p2p.Install(nodes.Get(3), nodes.Get(2));
-  NetDeviceContainer d2 = p2p.Install(nodes.Get(2), nodes.Get(1));
-  NetDeviceContainer d3 = p2p.Install(nodes.Get(1), nodes.Get(0));
-
-  Ipv4AddressHelper ipv4;
-  ipv4.SetBase("10.1.1.0", "255.255.255.0");
-  ipv4.Assign(d1);
-  ipv4.SetBase("10.1.2.0", "255.255.255.0");
-  ipv4.Assign(d2);
-  ipv4.SetBase("10.1.3.0", "255.255.255.0");
-  ipv4.Assign(d3);
-
-  // Set constant positions
-  MobilityHelper mobility;
-  mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
-  mobility.Install(nodes);
-  nodes.Get(3)->GetObject<MobilityModel>()->SetPosition(Vector(10, 10, 0)); // client
-  nodes.Get(2)->GetObject<MobilityModel>()->SetPosition(Vector(30, 10, 0)); // root
-  nodes.Get(1)->GetObject<MobilityModel>()->SetPosition(Vector(50, 10, 0)); // com
-  nodes.Get(0)->GetObject<MobilityModel>()->SetPosition(Vector(70, 10, 0)); // example.com
-
-  // Add DNSSEC client to node[3]
-  Ptr<DnssecClient> clientApp = CreateObject<DnssecClient>();
-  nodes.Get(3)->AddApplication(clientApp);
-  clientApp->SetStartTime(Seconds(0.5));
-
-  // Add UDP sink on example.com to receive dummy packet
-  uint16_t sinkPort = 9999;
-  Address sinkAddress(InetSocketAddress(Ipv4Address::GetAny(), sinkPort));
-  Ptr<Socket> sinkSocket = Socket::CreateSocket(nodes.Get(0), UdpSocketFactory::GetTypeId());
-  sinkSocket->Bind(sinkAddress);
-
-  // NetAnim XML output
-  AnimationInterface anim("dnssec-chain.xml");
-  anim.SetConstantPosition(nodes.Get(3), 10, 10); // client
-  anim.SetConstantPosition(nodes.Get(2), 30, 10); // root
-  anim.SetConstantPosition(nodes.Get(1), 50, 10); // com
-  anim.SetConstantPosition(nodes.Get(0), 70, 10); // example.com
-
-  anim.UpdateNodeDescription(nodes.Get(0), "example.com");
-  anim.UpdateNodeDescription(nodes.Get(1), "com");
-  anim.UpdateNodeDescription(nodes.Get(2), "root");
-  anim.UpdateNodeDescription(nodes.Get(3), "client");
-
-  Simulator::Stop(Seconds(3.0));
-  Simulator::Run();
-  Simulator::Destroy();
-
-  return 0;
+    return 0;
 }
